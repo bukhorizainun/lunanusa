@@ -1,0 +1,42 @@
+@import url('https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@300;400;500&family=Outfit:wght@300;400;500&family=Scheherazade+New:wght@400;700&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ── Base ── */
+*, *::before, *::after { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: #0B1C2D;
+  color: white;
+  font-family: 'Outfit', sans-serif;
+  font-weight: 300;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ── Scrollbar ── */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: #071524; }
+::-webkit-scrollbar-thumb { background: #D4AF3730; border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: #D4AF3760; }
+
+/* ── Selection ── */
+::selection { background: #D4AF3730; color: #D4AF37; }
+
+/* ── Mono font for numbers ── */
+.font-mono { font-family: 'JetBrains Mono', 'Fira Code', 'Courier New', monospace; }
+
+/* ── Custom scrollbar for tables ── */
+.overflow-x-auto::-webkit-scrollbar { height: 4px; }
+
+/* ── Orbit animation used in Logo SVG ── */
+@keyframes orbitSpin {
+  from { transform: rotate(0deg); }
+  to   { transform: rotate(360deg); }
+}
+@keyframes orbitSpinReverse {
+  from { transform: rotate(0deg); }
+  to   { transform: rotate(-360deg); }
+}

@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: lunanusa-api
+    env: docker
+    region: singapore  # closest to Indonesia
+    plan: starter
+    dockerfilePath: ./backend/Dockerfile
+    envVars:
+      - key: ALLOWED_ORIGINS
+        value: https://lunanusa.netlify.app,http://localhost:5173
+      - key: PYTHONUNBUFFERED
+        value: "1"
+    healthCheckPath: /health
+    autoDeploy: true

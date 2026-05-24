@@ -1,0 +1,10 @@
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+pydantic==2.5.3
+astropy==6.0.0
+numpy==1.26.3
+pytz==2024.1
+python-multipart==0.0.6
+httpx==0.26.0
+jplephem==2.22
+astroquery==0.4.7
