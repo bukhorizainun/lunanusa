@@ -2,7 +2,10 @@ import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 
 // https://vitejs.dev/config/
-export default defineConfig({
+// base '/lunanusa/' hanya saat build (untuk GitHub Pages project site);
+// dev server tetap di root '/'.
+export default defineConfig(({ command }) => ({
+  base: command === 'build' ? '/lunanusa/' : '/',
   plugins: [react()],
   server: {
     port: 5173,
@@ -14,4 +17,4 @@ export default defineConfig({
       }
     }
   }
-})
+}))
