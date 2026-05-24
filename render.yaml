@@ -1,14 +1,17 @@
 services:
   - type: web
     name: lunanusa-api
-    env: docker
-    region: singapore  # closest to Indonesia
-    plan: starter
+    runtime: docker
+    region: singapore            # terdekat ke Indonesia
+    plan: free                   # free tier (spin-down saat idle; cold start ~30-60s)
     dockerfilePath: ./backend/Dockerfile
-    envVars:
-      - key: ALLOWED_ORIGINS
-        value: https://lunanusa.netlify.app,http://localhost:5173
-      - key: PYTHONUNBUFFERED
-        value: "1"
+    dockerContext: ./backend     # build context = backend/ agar COPY menemukan file
     healthCheckPath: /health
     autoDeploy: true
+    envVars:
+      - key: ALLOWED_ORIGINS
+        value: https://bukhorizainun.github.io,http://localhost:5173
+      - key: EPHEMERIS
+        value: de440s
+      - key: PYTHONUNBUFFERED
+        value: "1"
