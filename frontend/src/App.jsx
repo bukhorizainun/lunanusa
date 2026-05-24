@@ -1,4 +1,6 @@
-import { BrowserRouter, Routes, Route } from "react-router-dom";
+// HashRouter dipakai agar routing tetap jalan di GitHub Pages (subpath /lunanusa/)
+// tanpa konfigurasi server / file 404.html.
+import { HashRouter, Routes, Route } from "react-router-dom";
 import Navbar from "./components/Navbar";
 import Hero from "./components/Hero";
 import Calculator from "./pages/Calculator";
@@ -28,7 +30,7 @@ function HomePage() {
 
 export default function App() {
   return (
-    <BrowserRouter>
+    <HashRouter>
       <div className="min-h-screen bg-[#0B1C2D]" style={{ fontFamily: "'Outfit', 'Inter', sans-serif" }}>
         <Navbar />
         <Routes>
@@ -39,6 +41,6 @@ export default function App() {
           <Route path="/kitab"       element={<KitabPage />} />
         </Routes>
       </div>
-    </BrowserRouter>
+    </HashRouter>
   );
 }
