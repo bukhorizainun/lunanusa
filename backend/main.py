@@ -43,7 +43,7 @@ import numpy as np
 
 # AstroPy
 from astropy.time import Time
-from astropy.coordinates import EarthLocation, AltAz, get_body, solar_system_ephemeris
+from astropy.coordinates import EarthLocation, AltAz, get_body, solar_system_ephemeris, TETE
 from astropy import units as u
 
 # astroquery (opsional) — untuk cross-check live ke NASA JPL Horizons.
@@ -1392,4 +1392,193 @@ async def imsakiyah(req: ImsakiyahRequest):
 
 @app.options("/imsakiyah")
 async def options_imsakiyah(request: Request):
+    return _preflight(request)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PETA VISIBILITAS HILAL GLOBAL  (Yallop 1997 q-test)
+#   Posisi Matahari & Bulan (DE440s, apparent of-date TETE) diambil hanya pada
+#   DERET WAKTU; seluruh geometri (ghurub, moonset, tinggi topometrik +paralaks,
+#   elongasi, q) dihitung analitik di numpy atas grid global → cepat & cache-able.
+# ─────────────────────────────────────────────────────────────────────────────
+_R_EARTH_KM = 6378.137
+_R_MOON_KM = 1737.4
+_MOON_SET_ALT = 0.125            # tinggi pusat Bulan saat terbenam (paralaks+SD+refraksi)
+
+# Zona Yallop (q): batas bawah → label
+_YALLOP_ZONES = [
+    (0.216,  "A", "Mudah terlihat mata telanjang"),
+    (-0.014, "B", "Terlihat dalam kondisi sempurna"),
+    (-0.160, "C", "Butuh alat bantu optik untuk menemukan, lalu bisa mata telanjang"),
+    (-0.232, "D", "Hanya terlihat dengan alat optik"),
+    (-0.293, "E", "Tak terlihat dengan teleskop (di bawah batas Danjon)"),
+    (-9e9,   "F", "Tak terlihat — Bulan belum/baru ijtimak"),
+]
+
+
+def _gmst_deg(jd: np.ndarray) -> np.ndarray:
+    """Greenwich Mean Sidereal Time (derajat) dari Julian Day (UT1≈UTC)."""
+    d = jd - 2451545.0
+    T = d / 36525.0
+    g = 280.46061837 + 360.98564736629 * d + 0.000387933 * T ** 2 - (T ** 3) / 38710000.0
+    return np.mod(g, 360.0)
+
+
+def _yallop_zone(q: float) -> tuple:
+    for lo, code, desc in _YALLOP_ZONES:
+        if q > lo:
+            return code, desc
+    return "F", _YALLOP_ZONES[-1][2]
+
+
+def _descending_crossings(jd: np.ndarray, vals: np.ndarray, target: float):
+    """Semua jd saat `vals` melintasi `target` menurun (interpolasi linear)."""
+    d = vals - target
+    out = []
+    for i in range(1, len(d)):
+        if d[i - 1] > 0.0 >= d[i] and d[i - 1] != d[i]:
+            frac = d[i - 1] / (d[i - 1] - d[i])
+            out.append(jd[i - 1] + frac * (jd[i] - jd[i - 1]))
+    return out
+
+
+def _hilal_point(phi_rad, lon, jd, gmst, sun_ra, sun_dec, moon_ra, moon_dec,
+                 moon_par, expected_ss_jd, conj_jd):
+    """Hitung visibilitas hilal di satu titik. Kembalikan (q, zone, detail) atau None."""
+    # Tinggi Matahari (geometris) sepanjang deret waktu.
+    H_s = np.radians(gmst + lon - sun_ra)
+    sin_hs = (np.sin(phi_rad) * np.sin(np.radians(sun_dec)) +
+              np.cos(phi_rad) * np.cos(np.radians(sun_dec)) * np.cos(H_s))
+    sun_alt = np.degrees(np.arcsin(np.clip(sin_hs, -1, 1)))
+
+    ss_list = _descending_crossings(jd, sun_alt, SUN_HORIZON)
+    if not ss_list:
+        return None                                  # tak ada ghurub (siang kutub)
+    ss_jd = min(ss_list, key=lambda j: abs(j - expected_ss_jd))
+
+    # Tinggi Bulan topometrik (geometris + koreksi paralaks).
+    H_m = np.radians(gmst + lon - moon_ra)
+    sin_hm = (np.sin(phi_rad) * np.sin(np.radians(moon_dec)) +
+              np.cos(phi_rad) * np.cos(np.radians(moon_dec)) * np.cos(H_m))
+    moon_alt_g = np.degrees(np.arcsin(np.clip(sin_hm, -1, 1)))
+    moon_alt = moon_alt_g - moon_par * np.cos(np.radians(moon_alt_g))
+
+    ms_list = [j for j in _descending_crossings(jd, moon_alt, _MOON_SET_ALT) if j > ss_jd]
+    if not ms_list:
+        return None
+    ms_jd = min(ms_list)
+    lag_min = (ms_jd - ss_jd) * 1440.0
+    if lag_min <= 0:
+        return None
+
+    bt_jd = ss_jd + (4.0 / 9.0) * (ms_jd - ss_jd)    # "best time" Bruin
+    return ss_jd, ms_jd, bt_jd, lag_min, moon_alt, sun_alt
+
+
+def compute_hilal_map(date_str: str, grid_step: float = 5.0, lat_limit: float = 60.0) -> dict:
+    base = datetime.strptime(date_str, "%Y-%m-%d")
+    ref_loc = EarthLocation(lat=0 * u.deg, lon=0 * u.deg, height=0 * u.m)
+
+    # Deret waktu menutupi seluruh ghurub di Bumi pada `date` + moonset sesudahnya.
+    start = base
+    n = int(38 * 60 / 10) + 1                         # 38 jam, langkah 10 mnt
+    times = [start + timedelta(minutes=10 * i) for i in range(n)]
+    tt = Time(times)
+    jd = np.atleast_1d(tt.jd)
+    gmst = _gmst_deg(jd)
+
+    with solar_system_ephemeris.set(_EPHEMERIS_ACTIVE):
+        conj = find_conjunction(base, ref_loc)
+        sun = get_body("sun", tt).transform_to(TETE(obstime=tt))
+        moon = get_body("moon", tt).transform_to(TETE(obstime=tt))
+    conj_jd = float(Time(conj).jd) if conj else None
+    sun_ra, sun_dec = sun.ra.deg, sun.dec.deg
+    moon_ra, moon_dec = moon.ra.deg, moon.dec.deg
+    moon_dist = moon.distance.to(u.km).value
+    moon_par = np.degrees(np.arcsin(_R_EARTH_KM / moon_dist))
+    moon_sd_arcmin = np.degrees(np.arcsin(_R_MOON_KM / moon_dist)) * 60.0
+    # Elongasi geosentris (arc of light) sepanjang waktu.
+    elong = np.degrees(np.arccos(np.clip(
+        np.sin(np.radians(sun_dec)) * np.sin(np.radians(moon_dec)) +
+        np.cos(np.radians(sun_dec)) * np.cos(np.radians(moon_dec)) *
+        np.cos(np.radians(sun_ra - moon_ra)), -1, 1)))
+
+    lats = np.arange(lat_limit, -lat_limit - 1e-9, -grid_step)   # utara→selatan
+    lons = np.arange(-180, 180 + 1e-9, grid_step)
+    zone_counts = {z[1]: 0 for z in _YALLOP_ZONES}
+    cells = []
+
+    for lat in lats:
+        phi = np.radians(lat)
+        for lon in lons:
+            exp_ss = float(Time(datetime(base.year, base.month, base.day, 18)
+                                - timedelta(hours=lon / 15.0)).jd)
+            res = _hilal_point(phi, lon, jd, gmst, sun_ra, sun_dec, moon_ra, moon_dec,
+                               moon_par, exp_ss, conj_jd)
+            if res is None:
+                continue
+            ss_jd, ms_jd, bt_jd, lag_min, moon_alt, sun_alt = res
+            arcv = float(np.interp(bt_jd, jd, moon_alt) - np.interp(bt_jd, jd, sun_alt))
+            elong_bt = float(np.interp(bt_jd, jd, elong))
+            sd_bt = float(np.interp(bt_jd, jd, moon_sd_arcmin))
+            W = sd_bt * (1 - math.cos(math.radians(elong_bt)))     # arcmin
+            q = (arcv - (11.8371 - 6.3226 * W + 0.7319 * W ** 2 - 0.1018 * W ** 3)) / 10.0
+
+            born = (conj_jd is None) or (bt_jd >= conj_jd)
+            if not born:
+                code = "F"
+            else:
+                code, _ = _yallop_zone(q)
+            zone_counts[code] += 1
+            cells.append({"lat": round(float(lat), 2), "lon": round(float(lon), 2),
+                          "q": round(q, 3), "zone": code,
+                          "arcv": round(arcv, 2), "elong": round(elong_bt, 2)})
+
+    return {
+        "date": date_str,
+        "grid_step": grid_step,
+        "lat_limit": lat_limit,
+        "conjunction_utc": conj.isoformat() if conj else None,
+        "cells": cells,
+        "zone_counts": zone_counts,
+        "zones_legend": [{"code": z[1], "min_q": (None if z[0] < -1e8 else z[0]),
+                          "desc": z[2]} for z in _YALLOP_ZONES],
+        "meta": {
+            "criterion": "Yallop 1997 (q-test, best time)",
+            "ephemeris": f"NASA JPL {_EPHEMERIS_ACTIVE.upper()}"
+                         if _EPHEMERIS_ACTIVE != "builtin" else "AstroPy builtin (ERFA/SOFA)",
+            "note": ("Tinggi topometrik (paralaks) airless di 'best time' = ghurub + 4/9·(moonset−ghurub). "
+                     "W = lebar sabit dari elongasi & jarak Bulan. Proyeksi peta: equirectangular."),
+            "computed_at": datetime.utcnow().isoformat() + "Z",
+        },
+    }
+
+
+class HilalMapRequest(BaseModel):
+    date: str = Field(..., description="YYYY-MM-DD (Masehi), malam yang dievaluasi")
+    grid_step: float = Field(default=5.0, ge=2.0, le=15.0)
+    lat_limit: float = Field(default=60.0, ge=30.0, le=75.0)
+
+
+_HILAL_MAP_CACHE: dict = {}
+
+
+@app.post("/hilal-map")
+async def hilal_map(req: HilalMapRequest):
+    try:
+        key = (req.date, req.grid_step, req.lat_limit)
+        if key not in _HILAL_MAP_CACHE:
+            if len(_HILAL_MAP_CACHE) > 60:
+                _HILAL_MAP_CACHE.clear()
+            _HILAL_MAP_CACHE[key] = sanitize(
+                compute_hilal_map(req.date, req.grid_step, req.lat_limit))
+        return _HILAL_MAP_CACHE[key]
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Computation error: {e}")
+
+
+@app.options("/hilal-map")
+async def options_hilal_map(request: Request):
     return _preflight(request)
