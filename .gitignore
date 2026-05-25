@@ -27,3 +27,4 @@ Thumbs.db
 # Large source PDF & extracted text (keep out of git; cite instead)
 *.pdf
 zij_text_dump.txt
+.gstack/

@@ -9,10 +9,12 @@ import { Link, useLocation } from "react-router-dom";
 import Logo from "./Logo";
 
 const NAV_LINKS = [
-  { href: "/",           label: "Calculator"   },
-  { href: "/comparison", label: "Comparison"   },
-  { href: "/astronomy",  label: "Astronomy"    },
-  { href: "/kitab",      label: "Kitab Klasik" },
+  { href: "/calculator",   label: "Calculator"    },
+  { href: "/prayer-times", label: "Jadwal Sholat" },
+  { href: "/qibla",        label: "Arah Kiblat"   },
+  { href: "/comparison",   label: "Comparison"    },
+  { href: "/astronomy",    label: "Astronomy"     },
+  { href: "/kitab",        label: "Kitab Klasik"  },
 ];
 
 export default function Navbar() {

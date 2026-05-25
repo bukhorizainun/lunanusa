@@ -136,6 +136,29 @@ class CalculationRequest(BaseModel):
     timezone:  str   = Field(default="Asia/Jakarta")
 
 
+class PrayerTimesRequest(BaseModel):
+    date:        str   = Field(..., description="YYYY-MM-DD (tanggal Masehi)")
+    latitude:    float = Field(..., ge=-90,  le=90)
+    longitude:   float = Field(..., ge=-180, le=180)
+    elevation:   float = Field(default=0, ge=0)
+    timezone:    str   = Field(default="Asia/Jakarta")
+    convention:  str   = Field(default="Kemenag",
+                               description="Kemenag | MWL | Egypt | Karachi | ISNA | UmmAlQura")
+    asr_madhhab: str   = Field(default="Syafii", description="Syafii (bayangan 1x) | Hanafi (2x)")
+    ihtiyat_minutes: int = Field(default=2, ge=0, le=10,
+                                 description="Menit ihtiyat (pengaman) ala Kemenag")
+
+
+class QiblaRequest(BaseModel):
+    latitude:  float = Field(..., ge=-90,  le=90)
+    longitude: float = Field(..., ge=-180, le=180)
+    elevation: float = Field(default=0, ge=0)
+    date:      Optional[str] = Field(default=None,
+                                     description="Opsional YYYY-MM-DD: jika diisi, hitung waktu "
+                                                 "bayangan kiblat (Rashdul Kiblat) harian.")
+    timezone:  str   = Field(default="Asia/Jakarta")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # MATH UTILITIES
 # ─────────────────────────────────────────────────────────────────────────────
@@ -578,7 +601,7 @@ async def root():
         "service": "LunaNusa Hilal Calculation API",
         "version": "2.0.0",
         "ephemeris": f"NASA JPL {_EPHEMERIS_ACTIVE}",
-        "endpoints": ["/calculate", "/health", "/methods", "/horizons-check"],
+        "endpoints": ["/calculate", "/prayer-times", "/qibla", "/health", "/methods", "/horizons-check"],
         "horizons_live": HORIZONS_AVAILABLE,
     }
 
@@ -607,6 +630,282 @@ async def methods():
             "R. S. Park et al., 'The JPL Planetary and Lunar Ephemerides DE440 and DE441', AJ, 2021.",
         ],
     }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# JADWAL SHOLAT & ARAH KIBLAT
+# ─────────────────────────────────────────────────────────────────────────────
+# Ka'bah (Masjidil Haram) — koordinat geodetik WGS84.
+KAABA_LAT = 21.422487
+KAABA_LON = 39.826206
+
+# Konvensi sudut depresi Matahari untuk Subuh (fajr) & Isya, diukur sebagai
+# sudut Matahari DI BAWAH ufuk (geometris). Sumber rangkuman: PrayTimes.org;
+# Kemenag RI memakai 20°/18° (Almanak Hisab Rukyat).
+PRAYER_CONVENTIONS = {
+    "Kemenag":   {"fajr": 20.0, "isha": 18.0, "label": "Kementerian Agama RI"},
+    "MWL":       {"fajr": 18.0, "isha": 17.0, "label": "Muslim World League"},
+    "Egypt":     {"fajr": 19.5, "isha": 17.5, "label": "Egyptian General Authority"},
+    "Karachi":   {"fajr": 18.0, "isha": 18.0, "label": "Univ. of Islamic Sciences, Karachi"},
+    "ISNA":      {"fajr": 15.0, "isha": 15.0, "label": "Islamic Society of North America"},
+    "UmmAlQura": {"fajr": 18.5, "isha": None, "isha_interval_min": 90,
+                  "label": "Umm al-Qura, Makkah"},
+}
+# Faktor panjang bayangan untuk Ashar (panjang bayangan = faktor × tinggi benda,
+# di atas panjang bayangan saat istiwa').
+ASR_FACTOR = {"Syafii": 1.0, "Jumhur": 1.0, "Maliki": 1.0, "Hanafi": 2.0}
+
+# Matahari "terbit/terbenam" untuk jadwal sholat: piringan ATAS menyentuh ufuk →
+# tinggi pusat Matahari = -(refraksi 34' + semidiameter 16') = -0,8333°.
+SUN_HORIZON = -0.8333
+
+# Kompas 16 arah (azimut dari Utara sejati).
+COMPASS_16 = ["N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE",
+              "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"]
+
+
+def compass_point(bearing: float) -> str:
+    return COMPASS_16[int((bearing % 360) / 22.5 + 0.5) % 16]
+
+
+def qibla_bearing(lat: float, lon: float) -> float:
+    """Azimut kiblat: arah ke Ka'bah dari Utara sejati (searah jarum jam).
+
+    Initial bearing great-circle pada bola; akurat untuk penentuan arah kiblat.
+    """
+    phi = dtr(lat)
+    dlon = dtr(KAABA_LON - lon)
+    y = math.sin(dlon)
+    x = math.cos(phi) * math.tan(dtr(KAABA_LAT)) - math.sin(phi) * math.cos(dlon)
+    return normalize(rtd(math.atan2(y, x)))
+
+
+def great_circle_km(lat: float, lon: float) -> float:
+    """Jarak permukaan (haversine) dari (lat,lon) ke Ka'bah, kilometer."""
+    R = 6371.0088
+    p1, p2 = dtr(lat), dtr(KAABA_LAT)
+    dp = dtr(KAABA_LAT - lat)
+    dl = dtr(KAABA_LON - lon)
+    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+
+def _sun_altaz_airless_array(times: List[datetime], location: EarthLocation):
+    """(alt, az) Matahari AIRLESS (tanpa refraksi) untuk banyak waktu sekaligus.
+
+    Airless dipakai karena sudut konvensi sholat (-0,8333°, -18°, -20° …)
+    didefinisikan sebagai sudut geometris Matahari terhadap ufuk.
+    """
+    obstime = Time(times)
+    frame = AltAz(obstime=obstime, location=location)   # tanpa pressure → no refraction
+    sun = get_body("sun", obstime, location).transform_to(frame)
+    return np.atleast_1d(sun.alt.deg), np.atleast_1d(sun.az.deg)
+
+
+def _local_day_grid(local_date: datetime, tz, step_min: int = 1) -> List[datetime]:
+    """Grid waktu (datetime UTC naif) menutupi satu hari kalender LOKAL."""
+    day0 = tz.localize(datetime(local_date.year, local_date.month, local_date.day, 0, 0, 0))
+    n = int(24 * 60 / step_min) + 1
+    return [(day0 + timedelta(minutes=step_min * i)).astimezone(pytz.utc).replace(tzinfo=None)
+            for i in range(n)]
+
+
+def _parabolic_extremum(times: List[datetime], values: np.ndarray, i: int) -> datetime:
+    """Refine waktu puncak (transit Matahari) via interpolasi parabolik 3-titik."""
+    if i <= 0 or i >= len(values) - 1:
+        return times[i]
+    y0, y1, y2 = float(values[i - 1]), float(values[i]), float(values[i + 1])
+    denom = y0 - 2 * y1 + y2
+    if denom == 0:
+        return times[i]
+    offset = 0.5 * (y0 - y2) / denom                      # satuan indeks, ~[-1,1]
+    dt = (times[i + 1] - times[i]).total_seconds()
+    return times[i] + timedelta(seconds=offset * dt)
+
+
+def _sun_declination(t_utc: datetime, location: EarthLocation) -> float:
+    """Deklinasi Matahari (derajat) pada instan tertentu — untuk rumus Ashar."""
+    sun = get_body("sun", Time(t_utc), location)
+    return float(sun.dec.deg)
+
+
+def _az_crossing_times(times, az, alt, target):
+    """Waktu saat azimut Matahari melewati `target` (derajat), hanya saat di atas ufuk."""
+    out = []
+    for i in range(1, len(az)):
+        if alt[i] <= 0.0 and alt[i - 1] <= 0.0:
+            continue
+        a = ((float(az[i - 1]) - target + 180.0) % 360.0) - 180.0
+        b = ((float(az[i]) - target + 180.0) % 360.0) - 180.0
+        if abs(b - a) > 180.0:                            # lompatan wrap-around → abaikan
+            continue
+        if (a <= 0.0 <= b) or (a >= 0.0 >= b):
+            if (b - a) == 0:
+                continue
+            frac = (0.0 - a) / (b - a)
+            dt = (times[i] - times[i - 1]).total_seconds()
+            tc = times[i - 1] + timedelta(seconds=dt * frac)
+            ac = float(alt[i - 1]) + (float(alt[i]) - float(alt[i - 1])) * frac
+            if ac > 0.0:
+                out.append((tc, ac))
+    return out
+
+
+def compute_prayer_times(req: PrayerTimesRequest) -> dict:
+    tz = pytz.timezone(req.timezone)
+    local_date = datetime.strptime(req.date, "%Y-%m-%d")
+    location = EarthLocation(lat=req.latitude * u.deg, lon=req.longitude * u.deg,
+                             height=req.elevation * u.m)
+    conv = PRAYER_CONVENTIONS.get(req.convention, PRAYER_CONVENTIONS["Kemenag"])
+    asr_factor = ASR_FACTOR.get(req.asr_madhhab, 1.0)
+
+    with solar_system_ephemeris.set(_EPHEMERIS_ACTIVE):
+        times = _local_day_grid(local_date, tz, step_min=1)
+        alt, az = _sun_altaz_airless_array(times, location)
+
+        i_tr = int(np.argmax(alt))                        # transit (kulminasi) → Dzuhur
+        transit_utc = _parabolic_extremum(times, alt, i_tr)
+        decl = _sun_declination(transit_utc, location)
+
+        # Tinggi Matahari saat Ashar: cot(h) = faktor + tan|φ − δ|
+        asr_alt = rtd(math.atan(1.0 / (asr_factor + math.tan(abs(dtr(req.latitude - decl))))))
+
+        # Koreksi kerendahan ufuk (dip) untuk observer di ketinggian: ~1,76'·√(h_m)
+        dip = 1.76 * math.sqrt(max(req.elevation, 0.0)) / 60.0
+        horizon = SUN_HORIZON - dip
+
+        def morning(target):
+            return _find_crossing(times[:i_tr + 1], alt[:i_tr + 1], target, rising=True)
+
+        def evening(target):
+            return _find_crossing(times[i_tr:], alt[i_tr:], target, rising=False)
+
+        terbit_utc  = morning(horizon)
+        maghrib_utc = evening(horizon)
+        subuh_utc   = morning(-conv["fajr"])
+        ashar_utc   = evening(asr_alt)
+        dhuha_utc   = morning(4.5)                         # awal Dhuha: Matahari +4,5°
+        if conv.get("isha") is not None:
+            isya_utc = evening(-conv["isha"])
+        else:                                              # Umm al-Qura: Maghrib + interval tetap
+            isya_utc = (maghrib_utc + timedelta(minutes=conv["isha_interval_min"])
+                        if maghrib_utc else None)
+
+    # ── Ihtiyat (pengaman) ── tambah ke waktu mulai; kurangi untuk terbit ──────
+    ih = timedelta(minutes=req.ihtiyat_minutes)
+    subuh   = subuh_utc   + ih if subuh_utc   else None
+    dzuhur  = transit_utc + ih
+    ashar   = ashar_utc   + ih if ashar_utc   else None
+    maghrib = maghrib_utc + ih if maghrib_utc else None
+    isya    = isya_utc    + ih if isya_utc    else None
+    terbit  = terbit_utc  - ih if terbit_utc  else None
+    dhuha   = dhuha_utc   + ih if dhuha_utc   else None
+    imsak   = (subuh - timedelta(minutes=10)) if subuh else None
+
+    def fmt(dt_utc):
+        if dt_utc is None:
+            return None
+        loc = dt_utc.replace(tzinfo=pytz.utc).astimezone(tz)
+        return {"time": loc.strftime("%H:%M"), "iso": loc.isoformat()}
+
+    return {
+        "date": req.date,
+        "times": {
+            "imsak":   fmt(imsak),
+            "subuh":   fmt(subuh),
+            "terbit":  fmt(terbit),
+            "dhuha":   fmt(dhuha),
+            "dzuhur":  fmt(dzuhur),
+            "ashar":   fmt(ashar),
+            "maghrib": fmt(maghrib),
+            "isya":    fmt(isya),
+        },
+        "convention": {
+            "key":        req.convention,
+            "label":      conv["label"],
+            "fajr_angle": conv["fajr"],
+            "isha_angle": conv.get("isha"),
+            "asr_madhhab": req.asr_madhhab,
+            "asr_factor":  asr_factor,
+            "ihtiyat_minutes": req.ihtiyat_minutes,
+        },
+        "sun": {
+            "transit_local":   fmt(transit_utc),
+            "declination_deg": round(decl, 4),
+            "asr_altitude_deg": round(asr_alt, 4),
+            "horizon_deg":     round(horizon, 4),
+        },
+        "location": {
+            "latitude": req.latitude, "longitude": req.longitude,
+            "elevation": req.elevation, "timezone": req.timezone,
+        },
+        "meta": {
+            "ephemeris": f"NASA JPL {_EPHEMERIS_ACTIVE.upper()}"
+                         if _EPHEMERIS_ACTIVE != "builtin"
+                         else "AstroPy builtin (ERFA/SOFA)",
+            "note": "Sudut sholat geometris (airless). Maghrib/Terbit pada tinggi pusat "
+                    f"{round(horizon, 4)}° (piringan atas di ufuk + koreksi dip).",
+            "computed_at": datetime.utcnow().isoformat() + "Z",
+        },
+    }
+
+
+def compute_qibla(req: QiblaRequest) -> dict:
+    bearing = qibla_bearing(req.latitude, req.longitude)
+    out = {
+        "qibla_bearing_deg": round(bearing, 4),
+        "qibla_bearing_dms": deg_to_dms(bearing),
+        "compass_point":     compass_point(bearing),
+        "distance_km":       round(great_circle_km(req.latitude, req.longitude), 1),
+        "kaaba": {"latitude": KAABA_LAT, "longitude": KAABA_LON},
+        "observer": {"latitude": req.latitude, "longitude": req.longitude},
+        "method": "Initial bearing great-circle dari Utara sejati (searah jarum jam).",
+    }
+
+    # Bonus: waktu bayangan kiblat harian (Rashdul Kiblat lokal) bila tanggal diberi.
+    if req.date:
+        tz = pytz.timezone(req.timezone)
+        local_date = datetime.strptime(req.date, "%Y-%m-%d")
+        location = EarthLocation(lat=req.latitude * u.deg, lon=req.longitude * u.deg,
+                                 height=req.elevation * u.m)
+        with solar_system_ephemeris.set(_EPHEMERIS_ACTIVE):
+            times = _local_day_grid(local_date, tz, step_min=1)
+            alt, az = _sun_altaz_airless_array(times, location)
+
+        def to_local(items):
+            return [{"time": t.replace(tzinfo=pytz.utc).astimezone(tz).strftime("%H:%M:%S"),
+                     "sun_altitude": round(a, 2)} for (t, a) in items]
+
+        # Bayangan benda tegak berlawanan arah azimut Matahari.
+        # Bayangan menunjuk KIBLAT  ⇔  azimut Matahari = bearing + 180°.
+        out["shadow_aligns_qibla"] = to_local(_az_crossing_times(times, az, alt, (bearing + 180.0) % 360.0))
+        # Matahari TEPAT di arah kiblat ⇒ bayangan membelakangi kiblat.
+        out["sun_in_qibla_direction"] = to_local(_az_crossing_times(times, az, alt, bearing))
+        out["date"] = req.date
+        out["note_shadow"] = ("Pada waktu 'shadow_aligns_qibla', bayangan benda tegak menunjuk "
+                              "PERSIS ke arah kiblat — kalibrasi kiblat tanpa kompas.")
+
+    return out
+
+
+@app.post("/prayer-times")
+async def prayer_times(req: PrayerTimesRequest):
+    try:
+        return sanitize(compute_prayer_times(req))
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Computation error: {e}")
+
+
+@app.post("/qibla")
+async def qibla(req: QiblaRequest):
+    try:
+        return sanitize(compute_qibla(req))
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Computation error: {e}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -672,8 +971,7 @@ async def horizons_check(req: CalculationRequest):
 
 
 # ── Preflight eksplisit (jaga-jaga di belakang proxy) ───────────────────────
-@app.options("/calculate")
-async def options_calculate(request: Request):
+def _preflight(request: Request) -> Response:
     origin = request.headers.get("origin", "*")
     resp = Response(status_code=204)
     resp.headers["Access-Control-Allow-Origin"] = origin
@@ -681,3 +979,18 @@ async def options_calculate(request: Request):
     resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Accept"
     resp.headers["Access-Control-Max-Age"] = "600"
     return resp
+
+
+@app.options("/calculate")
+async def options_calculate(request: Request):
+    return _preflight(request)
+
+
+@app.options("/prayer-times")
+async def options_prayer_times(request: Request):
+    return _preflight(request)
+
+
+@app.options("/qibla")
+async def options_qibla(request: Request):
+    return _preflight(request)
