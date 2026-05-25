@@ -10,6 +10,7 @@ import Logo from "./Logo";
 
 const NAV_LINKS = [
   { href: "/calculator",   label: "Calculator"    },
+  { href: "/hijri",        label: "Kalender"      },
   { href: "/prayer-times", label: "Jadwal Sholat" },
   { href: "/qibla",        label: "Arah Kiblat"   },
   { href: "/comparison",   label: "Comparison"    },

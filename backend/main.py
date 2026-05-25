@@ -37,7 +37,7 @@ from typing import Optional, List
 import math
 import os
 import pytz
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 import numpy as np
 
 # AstroPy
@@ -993,4 +993,246 @@ async def options_prayer_times(request: Request):
 
 @app.options("/qibla")
 async def options_qibla(request: Request):
+    return _preflight(request)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# KALENDER HIJRIAH OTOMATIS
+#   Konversi tabular (Kuwaiti algorithm, kalender Hijriah sipil) sebagai rangka,
+#   lalu awal bulan DIKOREKSI secara astronomis: ijtimak (NASA JPL) + kriteria
+#   visibilitas hilal (Wujudul Hilal / MABIMS) pada lokasi & ghurub setempat.
+# ─────────────────────────────────────────────────────────────────────────────
+HIJRI_MONTHS = ["Muharram", "Safar", "Rabiul Awal", "Rabiul Akhir",
+                "Jumadil Awal", "Jumadil Akhir", "Rajab", "Syaban",
+                "Ramadhan", "Syawal", "Zulkaidah", "Zulhijah"]
+# Indeks via isoweekday()%7 → Ahad=0 … Sabtu=6
+WEEKDAYS_ID = ["Ahad", "Senin", "Selasa", "Rabu", "Kamis", "Jumat", "Sabtu"]
+
+
+def _greg_to_jd(gy: int, gm: int, gd: int) -> int:
+    """Tanggal Masehi (Gregorian) → Julian Day Number (integer)."""
+    a = (14 - gm) // 12
+    y = gy + 4800 - a
+    m = gm + 12 * a - 3
+    return gd + (153 * m + 2) // 5 + 365 * y + y // 4 - y // 100 + y // 400 - 32045
+
+
+def _jd_to_greg(jd: int):
+    """JDN → (tahun, bulan, hari) Masehi."""
+    a = jd + 32044
+    b = (4 * a + 3) // 146097
+    c = a - (146097 * b) // 4
+    d = (4 * c + 3) // 1461
+    e = c - (1461 * d) // 4
+    m = (5 * e + 2) // 153
+    day = e - (153 * m + 2) // 5 + 1
+    month = m + 3 - 12 * (m // 10)
+    year = 100 * b + d - 4800 + m // 10
+    return year, month, day
+
+
+# Kalender Hijriah TABULAR (sipil / Kuwaiti). Epoch 1 Muharram 1 H = JD 1948440.
+def _greg_to_hijri(gy: int, gm: int, gd: int):
+    jd = _greg_to_jd(gy, gm, gd)
+    l = jd - 1948440 + 10632
+    n = (l - 1) // 10631
+    l = l - 10631 * n + 354
+    j = ((10985 - l) // 5316) * ((50 * l) // 17719) + (l // 5670) * ((43 * l) // 15238)
+    l = l - ((30 - j) // 15) * ((17719 * j) // 50) - (j // 16) * ((15238 * j) // 43) + 29
+    hm = (24 * l) // 709
+    hd = l - (709 * hm) // 24
+    hy = 30 * n + j - 30
+    return hy, hm, hd
+
+
+def _hijri_to_jd(hy: int, hm: int, hd: int) -> int:
+    return ((11 * hy + 3) // 30) + 354 * hy + 30 * hm - (hm - 1) // 2 + hd + 1948440 - 385
+
+
+def _hijri_to_greg(hy: int, hm: int, hd: int):
+    return _jd_to_greg(_hijri_to_jd(hy, hm, hd))
+
+
+def _weekday_id(d: date) -> str:
+    return WEEKDAYS_ID[d.isoweekday() % 7]
+
+
+class HijriConvertRequest(BaseModel):
+    direction: str = Field("g2h", description="g2h (Masehi→Hijriah) | h2g (Hijriah→Masehi)")
+    # untuk g2h:
+    date: Optional[str] = Field(None, description="YYYY-MM-DD (Masehi) bila direction=g2h")
+    # untuk h2g:
+    hijri_year:  Optional[int] = Field(None, ge=1, le=2000)
+    hijri_month: Optional[int] = Field(None, ge=1, le=12)
+    hijri_day:   Optional[int] = Field(None, ge=1, le=30)
+
+
+class HijriCalendarRequest(BaseModel):
+    hijri_year:  int = Field(..., ge=1300, le=1600)
+    hijri_month: int = Field(..., ge=1, le=12)
+    latitude:    float = Field(default=-6.2, ge=-90, le=90)
+    longitude:   float = Field(default=106.8, ge=-180, le=180)
+    elevation:   float = Field(default=0, ge=0)
+    timezone:    str   = Field(default="Asia/Jakarta")
+    criterion:   str   = Field(default="MABIMS",
+                               description="MABIMS | Muhammadiyah | Tabular")
+
+
+def _hilal_decision(eve: date, location: EarthLocation, criterion: str,
+                    conj: Optional[datetime] = None):
+    """Evaluasi hilal pada ghurub tanggal `eve`. Kembalikan (visible, detail).
+    `conj` (ijtimak) boleh di-pass agar tak dihitung ulang untuk tiap malam."""
+    utc_noon = datetime(eve.year, eve.month, eve.day, 6, 0, 0)
+    with solar_system_ephemeris.set(_EPHEMERIS_ACTIVE):
+        sunset_utc = find_sunset(location, utc_noon)
+        if conj is None:
+            conj = find_conjunction(datetime(eve.year, eve.month, eve.day), location)
+        moon_alt, _ = _altaz_single("moon", sunset_utc, location)
+        elong = float(_separation_array([sunset_utc], location)[0])
+    conj_before = bool(conj < sunset_utc) if conj else False
+    if criterion == "MABIMS":
+        crit = mabims_criterion(moon_alt, elong, conj_before)
+    else:  # Muhammadiyah / Wujudul Hilal
+        crit = muhammadiyah_criterion(moon_alt, conj_before)
+    return crit["visible"], {
+        "sunset_utc": conj and sunset_utc.isoformat(),
+        "moon_altitude": round(moon_alt, 3),
+        "elongation": round(elong, 3),
+        "conjunction_utc": conj.isoformat() if conj else None,
+        "conjunction_before_sunset": conj_before,
+        "reason": crit["reason"],
+    }
+
+
+def _month_start(hy: int, hm: int, location: EarthLocation, tz, criterion: str):
+    """Tanggal Masehi (date) awal bulan Hijriah (hy, hm) menurut `criterion`.
+    Tabular = aritmetika murni; MABIMS/Muhammadiyah = ijtimak + visibilitas."""
+    gy, gm, gd = _hijri_to_greg(hy, hm, 1)
+    tabular = date(gy, gm, gd)
+    if criterion == "Tabular":
+        return tabular, None
+
+    # Ijtimak di sekitar awal bulan tabular (find_conjunction cari ±5 hari).
+    with solar_system_ephemeris.set(_EPHEMERIS_ACTIVE):
+        conj = find_conjunction(datetime(tabular.year, tabular.month, tabular.day), location)
+    if conj is None:
+        return tabular, None
+    conj_local = conj.replace(tzinfo=pytz.utc).astimezone(tz)
+    conj_date = conj_local.date()
+
+    detail = None
+    # Cek ghurub pada hari ijtimak, lalu hari berikutnya (rukyat 29/30).
+    for off in (0, 1):
+        eve = conj_date + timedelta(days=off)
+        visible, det = _hilal_decision(eve, location, criterion, conj=conj)
+        if off == 0:
+            detail = det
+        if visible:
+            return eve + timedelta(days=1), det   # hari sipil berikut = tanggal 1
+    # Istikmal: bulan sebelumnya digenapkan 30 hari.
+    return conj_date + timedelta(days=2), detail
+
+
+def compute_hijri_calendar(req: HijriCalendarRequest) -> dict:
+    tz = pytz.timezone(req.timezone)
+    location = EarthLocation(lat=req.latitude * u.deg, lon=req.longitude * u.deg,
+                             height=req.elevation * u.m)
+
+    start, start_detail = _month_start(req.hijri_year, req.hijri_month, location, tz, req.criterion)
+    nh_y, nh_m = (req.hijri_year, req.hijri_month + 1) if req.hijri_month < 12 \
+        else (req.hijri_year + 1, 1)
+    nxt, _ = _month_start(nh_y, nh_m, location, tz, req.criterion)
+
+    length = (nxt - start).days
+    if length not in (29, 30):                       # jaga-jaga dari anomali numerik
+        length = max(29, min(30, length))
+
+    tabular_g = date(*_hijri_to_greg(req.hijri_year, req.hijri_month, 1))
+    today = datetime.now(tz).date()
+
+    days = []
+    for i in range(length):
+        g = start + timedelta(days=i)
+        days.append({
+            "hijri_day": i + 1,
+            "gregorian": g.isoformat(),
+            "weekday": _weekday_id(g),
+            "weekday_index": g.isoweekday() % 7,     # Ahad=0 … Sabtu=6 (untuk grid)
+            "is_today": g == today,
+        })
+
+    return {
+        "hijri_year":  req.hijri_year,
+        "hijri_month": req.hijri_month,
+        "month_name":  HIJRI_MONTHS[req.hijri_month - 1],
+        "criterion":   req.criterion,
+        "start_gregorian":   start.isoformat(),
+        "tabular_gregorian": tabular_g.isoformat(),
+        "delta_days_vs_tabular": (start - tabular_g).days,
+        "days_in_month": length,
+        "start_weekday_index": start.isoweekday() % 7,
+        "days": days,
+        "hilal_at_start": start_detail,
+        "location": {"latitude": req.latitude, "longitude": req.longitude,
+                     "elevation": req.elevation, "timezone": req.timezone},
+        "meta": {
+            "ephemeris": f"NASA JPL {_EPHEMERIS_ACTIVE.upper()}"
+                         if _EPHEMERIS_ACTIVE != "builtin"
+                         else "AstroPy builtin (ERFA/SOFA)",
+            "note": ("Kalender tabular (Kuwaiti) dikoreksi awal bulannya secara astronomis "
+                     "via ijtimak + kriteria " + req.criterion + ". Tabular = aritmetika murni."),
+            "computed_at": datetime.utcnow().isoformat() + "Z",
+        },
+    }
+
+
+@app.post("/hijri-convert")
+async def hijri_convert(req: HijriConvertRequest):
+    try:
+        if req.direction == "h2g":
+            if None in (req.hijri_year, req.hijri_month, req.hijri_day):
+                raise ValueError("hijri_year, hijri_month, hijri_day wajib untuk h2g")
+            gy, gm, gd = _hijri_to_greg(req.hijri_year, req.hijri_month, req.hijri_day)
+            g = date(gy, gm, gd)
+            return {
+                "gregorian": g.isoformat(),
+                "weekday": _weekday_id(g),
+                "hijri": {"year": req.hijri_year, "month": req.hijri_month,
+                          "day": req.hijri_day,
+                          "month_name": HIJRI_MONTHS[req.hijri_month - 1]},
+                "note": "Kalender Hijriah tabular (sipil). Awal bulan rukyat bisa ±1 hari.",
+            }
+        # g2h
+        ds = req.date or datetime.utcnow().strftime("%Y-%m-%d")
+        d = datetime.strptime(ds, "%Y-%m-%d").date()
+        hy, hm, hd = _greg_to_hijri(d.year, d.month, d.day)
+        return {
+            "gregorian": d.isoformat(),
+            "weekday": _weekday_id(d),
+            "hijri": {"year": hy, "month": hm, "day": hd,
+                      "month_name": HIJRI_MONTHS[hm - 1],
+                      "formatted": f"{hd} {HIJRI_MONTHS[hm - 1]} {hy} H"},
+            "note": "Kalender Hijriah tabular (sipil). Awal bulan rukyat bisa ±1 hari.",
+        }
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+
+@app.post("/hijri-calendar")
+async def hijri_calendar(req: HijriCalendarRequest):
+    try:
+        return sanitize(compute_hijri_calendar(req))
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Computation error: {e}")
+
+
+@app.options("/hijri-convert")
+async def options_hijri_convert(request: Request):
+    return _preflight(request)
+
+
+@app.options("/hijri-calendar")
+async def options_hijri_calendar(request: Request):
     return _preflight(request)

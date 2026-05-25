@@ -9,6 +9,7 @@ import AstronomyPage from "./pages/Astronomy";
 import KitabPage from "./pages/Kitab";
 import PrayerTimes from "./pages/PrayerTimes";
 import Qibla from "./pages/Qibla";
+import HijriCalendar from "./pages/HijriCalendar";
 
 function HomePage() {
   return (
@@ -40,6 +41,7 @@ export default function App() {
           <Route path="/calculator"  element={<Calculator />} />
           <Route path="/prayer-times" element={<PrayerTimes />} />
           <Route path="/qibla"        element={<Qibla />} />
+          <Route path="/hijri"        element={<HijriCalendar />} />
           <Route path="/comparison"  element={<Comparison />} />
           <Route path="/astronomy"   element={<AstronomyPage />} />
           <Route path="/kitab"       element={<KitabPage />} />
