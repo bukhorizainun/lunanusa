@@ -34,6 +34,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
 from typing import Optional, List
+import calendar as _calendar
 import math
 import os
 import pytz
@@ -1235,4 +1236,160 @@ async def options_hijri_convert(request: Request):
 
 @app.options("/hijri-calendar")
 async def options_hijri_calendar(request: Request):
+    return _preflight(request)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# IMSAKIYAH BULANAN
+#   Tabel jadwal sholat satu bulan penuh (mis. Imsakiyah Ramadhan), memakai
+#   ulang compute_prayer_times() per tanggal + kolom tanggal Hijriah.
+# ─────────────────────────────────────────────────────────────────────────────
+MONTHS_ID = ["Januari", "Februari", "Maret", "April", "Mei", "Juni",
+             "Juli", "Agustus", "September", "Oktober", "November", "Desember"]
+
+# Resolusi grid (menit) untuk imsakiyah sebulan. Grid lebih kasar dari single-day
+# (1 mnt) karena alt Matahari ~linear di sekitar event; interpolasi _find_crossing
+# menjaga akurasi ke menit. 4 mnt ≈ 11k titik/bulan (vs 44k), jauh lebih cepat.
+_IMSAK_STEP_MIN = 4
+
+
+class ImsakiyahRequest(BaseModel):
+    year:  int = Field(..., ge=1900, le=2200)
+    month: int = Field(..., ge=1, le=12)
+    latitude:    float = Field(default=-6.2, ge=-90, le=90)
+    longitude:   float = Field(default=106.8, ge=-180, le=180)
+    elevation:   float = Field(default=0, ge=0)
+    timezone:    str   = Field(default="Asia/Jakarta")
+    convention:  str   = Field(default="Kemenag")
+    asr_madhhab: str   = Field(default="Syafii")
+    ihtiyat_minutes: int = Field(default=2, ge=0, le=10)
+
+
+def compute_imsakiyah(req: ImsakiyahRequest) -> dict:
+    """Imsakiyah sebulan, TERVEKTORISASI: posisi Matahari sebulan dihitung dalam
+    satu panggilan AstroPy (bukan per-hari), lalu logika per-hari sama persis
+    dengan compute_prayer_times(). ~10–15x lebih cepat dari loop naif."""
+    tz = pytz.timezone(req.timezone)
+    location = EarthLocation(lat=req.latitude * u.deg, lon=req.longitude * u.deg,
+                             height=req.elevation * u.m)
+    conv = PRAYER_CONVENTIONS.get(req.convention, PRAYER_CONVENTIONS["Kemenag"])
+    asr_factor = ASR_FACTOR.get(req.asr_madhhab, 1.0)
+    ndays = _calendar.monthrange(req.year, req.month)[1]
+    cols = ["imsak", "subuh", "terbit", "dhuha", "dzuhur", "ashar", "maghrib", "isya"]
+
+    dip = 1.76 * math.sqrt(max(req.elevation, 0.0)) / 60.0
+    horizon = SUN_HORIZON - dip
+    ih = timedelta(minutes=req.ihtiyat_minutes)
+
+    # 1) Bangun grid per-hari, gabung jadi SATU array waktu.
+    slices, all_times = [], []
+    for d in range(1, ndays + 1):
+        grid = _local_day_grid(datetime(req.year, req.month, d), tz, step_min=_IMSAK_STEP_MIN)
+        slices.append((len(all_times), len(all_times) + len(grid)))
+        all_times.extend(grid)
+
+    # 2) SATU panggilan AstroPy untuk alt Matahari seluruh bulan.
+    with solar_system_ephemeris.set(_EPHEMERIS_ACTIVE):
+        alt_all, _ = _sun_altaz_airless_array(all_times, location)
+
+    # 3) Transit (kulminasi) per hari → kumpulkan untuk satu panggilan deklinasi.
+    day_ctx, transit_times = [], []
+    for (s, e) in slices:
+        times, alt = all_times[s:e], alt_all[s:e]
+        i_tr = int(np.argmax(alt))
+        transit_utc = _parabolic_extremum(times, alt, i_tr)
+        day_ctx.append((times, alt, i_tr, transit_utc))
+        transit_times.append(transit_utc)
+
+    # 4) SATU panggilan AstroPy untuk deklinasi Matahari di semua transit.
+    with solar_system_ephemeris.set(_EPHEMERIS_ACTIVE):
+        sun_tr = get_body("sun", Time(transit_times), location)
+        decls = np.atleast_1d(sun_tr.dec.deg)
+
+    def fmt(dt_utc):
+        if dt_utc is None:
+            return "—"
+        return dt_utc.replace(tzinfo=pytz.utc).astimezone(tz).strftime("%H:%M")
+
+    rows = []
+    for d, (times, alt, i_tr, transit_utc) in enumerate(day_ctx, start=1):
+        decl = float(decls[d - 1])
+        asr_alt = rtd(math.atan(1.0 / (asr_factor + math.tan(abs(dtr(req.latitude - decl))))))
+
+        def morning(target):
+            return _find_crossing(times[:i_tr + 1], alt[:i_tr + 1], target, rising=True)
+
+        def evening(target):
+            return _find_crossing(times[i_tr:], alt[i_tr:], target, rising=False)
+
+        terbit_utc, maghrib_utc = morning(horizon), evening(horizon)
+        subuh_utc, ashar_utc, dhuha_utc = morning(-conv["fajr"]), evening(asr_alt), morning(4.5)
+        if conv.get("isha") is not None:
+            isya_utc = evening(-conv["isha"])
+        else:
+            isya_utc = maghrib_utc + timedelta(minutes=conv["isha_interval_min"]) if maghrib_utc else None
+
+        subuh   = subuh_utc + ih if subuh_utc else None
+        vals = {
+            "imsak":   fmt(subuh - timedelta(minutes=10) if subuh else None),
+            "subuh":   fmt(subuh),
+            "terbit":  fmt(terbit_utc - ih if terbit_utc else None),
+            "dhuha":   fmt(dhuha_utc + ih if dhuha_utc else None),
+            "dzuhur":  fmt(transit_utc + ih),
+            "ashar":   fmt(ashar_utc + ih if ashar_utc else None),
+            "maghrib": fmt(maghrib_utc + ih if maghrib_utc else None),
+            "isya":    fmt(isya_utc + ih if isya_utc else None),
+        }
+        g = date(req.year, req.month, d)
+        hy, hm, hd = _greg_to_hijri(req.year, req.month, d)
+        rows.append({"day": d, "weekday": _weekday_id(g),
+                     "hijri": f"{hd} {HIJRI_MONTHS[hm - 1]}", "hijri_day": hd, **vals})
+
+    conv_info = {"key": req.convention, "label": conv["label"],
+                 "fajr_angle": conv["fajr"], "isha_angle": conv.get("isha"),
+                 "asr_madhhab": req.asr_madhhab, "asr_factor": asr_factor,
+                 "ihtiyat_minutes": req.ihtiyat_minutes}
+    meta_info = {
+        "ephemeris": f"NASA JPL {_EPHEMERIS_ACTIVE.upper()}"
+                     if _EPHEMERIS_ACTIVE != "builtin" else "AstroPy builtin (ERFA/SOFA)",
+        "note": f"Sudut sholat geometris (airless). Maghrib/Terbit pada tinggi pusat {round(horizon, 4)}° (piringan atas + dip).",
+        "computed_at": datetime.utcnow().isoformat() + "Z",
+    }
+
+    return {
+        "year": req.year,
+        "month": req.month,
+        "month_name": MONTHS_ID[req.month - 1],
+        "days_in_month": ndays,
+        "columns": cols,
+        "days": rows,
+        "convention": conv_info,
+        "location": {"latitude": req.latitude, "longitude": req.longitude,
+                     "elevation": req.elevation, "timezone": req.timezone},
+        "meta": meta_info,
+    }
+
+
+_IMSAK_CACHE: dict = {}          # key param → hasil; deterministik per bulan+lokasi
+
+
+@app.post("/imsakiyah")
+async def imsakiyah(req: ImsakiyahRequest):
+    try:
+        key = (req.year, req.month, round(req.latitude, 4), round(req.longitude, 4),
+               round(req.elevation, 1), req.timezone, req.convention,
+               req.asr_madhhab, req.ihtiyat_minutes)
+        if key not in _IMSAK_CACHE:
+            if len(_IMSAK_CACHE) > 200:
+                _IMSAK_CACHE.clear()
+            _IMSAK_CACHE[key] = sanitize(compute_imsakiyah(req))
+        return _IMSAK_CACHE[key]
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Computation error: {e}")
+
+
+@app.options("/imsakiyah")
+async def options_imsakiyah(request: Request):
     return _preflight(request)

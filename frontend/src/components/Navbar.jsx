@@ -12,6 +12,7 @@ const NAV_LINKS = [
   { href: "/calculator",   label: "Calculator"    },
   { href: "/hijri",        label: "Kalender"      },
   { href: "/prayer-times", label: "Jadwal Sholat" },
+  { href: "/imsakiyah",    label: "Imsakiyah"     },
   { href: "/qibla",        label: "Arah Kiblat"   },
   { href: "/comparison",   label: "Comparison"    },
   { href: "/astronomy",    label: "Astronomy"     },

@@ -10,6 +10,7 @@ import KitabPage from "./pages/Kitab";
 import PrayerTimes from "./pages/PrayerTimes";
 import Qibla from "./pages/Qibla";
 import HijriCalendar from "./pages/HijriCalendar";
+import Imsakiyah from "./pages/Imsakiyah";
 
 function HomePage() {
   return (
@@ -40,6 +41,7 @@ export default function App() {
           <Route path="/"            element={<HomePage />} />
           <Route path="/calculator"  element={<Calculator />} />
           <Route path="/prayer-times" element={<PrayerTimes />} />
+          <Route path="/imsakiyah"    element={<Imsakiyah />} />
           <Route path="/qibla"        element={<Qibla />} />
           <Route path="/hijri"        element={<HijriCalendar />} />
           <Route path="/comparison"  element={<Comparison />} />
